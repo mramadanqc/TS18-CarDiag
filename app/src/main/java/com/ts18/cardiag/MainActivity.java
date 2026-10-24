@@ -8,6 +8,7 @@ import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
 import android.database.Cursor;
@@ -100,6 +101,9 @@ public class MainActivity extends Activity {
         left.addView(btn("إيقاف", v -> stopAll()));
         left.addView(btn("نسخ التقرير", v -> copyReport()));
         left.addView(btn("مشاركة التقرير", v -> shareReport()));
+        left.addView(btn("☁ إعداد Google Drive", v -> driveSetup()));
+        left.addView(btn("☁ ربط حساب Drive", v -> driveLink()));
+        left.addView(btn("☁ رفع التقرير إلى Drive", v -> driveUpload()));
         left.addView(btn("مسح الشاشة", v -> { report.setLength(0); out.setText(""); }));
 
         LinearLayout right = new LinearLayout(this);
@@ -155,6 +159,73 @@ public class MainActivity extends Activity {
         watchBtn.setText("2) مراقب التغيّرات: ابدأ");
         if (elm != null) elm.stop();
         setBanner("اتوقف");
+    }
+
+    // ---------- Google Drive upload ----------
+    private DriveUploader drive() {
+        return new DriveUploader(getSharedPreferences("drive", MODE_PRIVATE), new DriveUploader.Log() {
+            @Override public void log(String s) { append(s); }
+            @Override public void banner(String s) { setBanner(s); }
+        });
+    }
+
+    private EditText field(String hint, String value) {
+        EditText e = new EditText(this);
+        e.setHint(hint);
+        e.setText(value);
+        e.setSingleLine(true);
+        return e;
+    }
+
+    private void driveSetup() {
+        final SharedPreferences p = getSharedPreferences("drive", MODE_PRIVATE);
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(dp(16), dp(8), dp(16), 0);
+        final EditText name = field("اسم الشاشة (اسم مجلد Drive)", p.getString("screen_name", "TS18-" + Build.MODEL));
+        final EditText cid = field("Client ID", p.getString("client_id", ""));
+        final EditText sec = field("Client Secret", p.getString("client_secret", ""));
+        box.addView(name);
+        box.addView(cid);
+        box.addView(sec);
+        new AlertDialog.Builder(this)
+                .setTitle("إعداد Google Drive")
+                .setView(box)
+                .setPositiveButton("حفظ", (d, w) -> {
+                    String newId = cid.getText().toString().trim();
+                    SharedPreferences.Editor ed = p.edit()
+                            .putString("screen_name", name.getText().toString().trim())
+                            .putString("client_id", newId)
+                            .putString("client_secret", sec.getText().toString().trim());
+                    if (!newId.equals(p.getString("client_id", ""))) ed.remove("refresh_token");
+                    ed.apply();
+                    Toast.makeText(this, "تم الحفظ", Toast.LENGTH_SHORT).show();
+                })
+                .setNegativeButton("إلغاء", null)
+                .show();
+    }
+
+    private void driveLink() {
+        append("=== ربط Google Drive ===");
+        final DriveUploader up = drive();
+        new Thread(new Runnable() {
+            @Override public void run() { up.link(); }
+        }).start();
+    }
+
+    private void driveUpload() {
+        SharedPreferences p = getSharedPreferences("drive", MODE_PRIVATE);
+        String screen = p.getString("screen_name", "TS18-" + Build.MODEL).trim();
+        if (screen.length() == 0) screen = "TS18";
+        final String folder = screen;
+        final String fileName = "report_" + new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date()) + ".txt";
+        final String content = "Screen: " + folder + "\nDevice: " + Build.MANUFACTURER + " " + Build.MODEL
+                + "\nAndroid: " + Build.VERSION.RELEASE + "\nTime: " + new Date() + "\n\n" + report.toString();
+        append("=== رفع التقرير إلى Drive (" + folder + "/" + fileName + ") ===");
+        final DriveUploader up = drive();
+        new Thread(new Runnable() {
+            @Override public void run() { up.upload(folder, fileName, content); }
+        }).start();
     }
 
     private void copyReport() {

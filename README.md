@@ -14,3 +14,6 @@ Use **Copy report** / **Share report** to export the output.
 - ELM327 adapters are slow and sample only part of the CAN traffic; use the ID filter for focused sniffing.
 - Read-only: the app never writes to the car.
 - Not device-tested.
+
+## Google Drive upload
+Needs a Google Cloud OAuth client of type **TVs and Limited Input devices** (Drive API enabled). In the app: *إعداد Google Drive* (screen name = Drive folder name, Client ID, Client Secret) → *ربط حساب Drive* (enter the shown code at google.com/device from a phone) → *رفع التقرير إلى Drive*. Uses the `drive.file` scope, so the app only sees files/folders it created.
