@@ -1,5 +1,6 @@
 package com.ts18.cardiag;
 
+import android.Manifest;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.bluetooth.BluetoothAdapter;
@@ -8,15 +9,16 @@ import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
-import android.content.SharedPreferences;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
 import android.database.Cursor;
 import android.media.AudioManager;
 import android.media.ToneGenerator;
 import android.net.Uri;
+import android.media.MediaScannerConnection;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Environment;
 import android.provider.Settings;
 import android.text.InputType;
 import android.util.DisplayMetrics;
@@ -31,7 +33,10 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileOutputStream;
 import java.io.InputStreamReader;
+import java.io.OutputStreamWriter;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Date;
@@ -49,6 +54,7 @@ public class MainActivity extends Activity {
     private final StringBuilder report = new StringBuilder();
     private volatile boolean watching = false;
     private ElmCan elm;
+    private boolean pendingSave = false;
 
     private int dp(int v) { return (int) (v * getResources().getDisplayMetrics().density + 0.5f); }
 
@@ -101,9 +107,7 @@ public class MainActivity extends Activity {
         left.addView(btn("إيقاف", v -> stopAll()));
         left.addView(btn("نسخ التقرير", v -> copyReport()));
         left.addView(btn("مشاركة التقرير", v -> shareReport()));
-        left.addView(btn("☁ إعداد Google Drive", v -> driveSetup()));
-        left.addView(btn("☁ ربط حساب Drive", v -> driveLink()));
-        left.addView(btn("☁ رفع التقرير إلى Drive", v -> driveUpload()));
+        left.addView(btn("حفظ التقرير كملف", v -> saveReport()));
         left.addView(btn("مسح الشاشة", v -> { report.setLength(0); out.setText(""); }));
 
         LinearLayout right = new LinearLayout(this);
@@ -161,71 +165,65 @@ public class MainActivity extends Activity {
         setBanner("اتوقف");
     }
 
-    // ---------- Google Drive upload ----------
-    private DriveUploader drive() {
-        return new DriveUploader(getSharedPreferences("drive", MODE_PRIVATE), new DriveUploader.Log() {
-            @Override public void log(String s) { append(s); }
-            @Override public void banner(String s) { setBanner(s); }
-        });
+    // ---------- save report as a file ----------
+    private void saveReport() {
+        if (report.length() == 0) {
+            Toast.makeText(this, "مفيش تقرير لسه", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        if (Build.VERSION.SDK_INT >= 23
+                && checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
+            pendingSave = true;
+            requestPermissions(new String[]{Manifest.permission.WRITE_EXTERNAL_STORAGE}, 7);
+            return;
+        }
+        doSave();
     }
 
-    private EditText field(String hint, String value) {
-        EditText e = new EditText(this);
-        e.setHint(hint);
-        e.setText(value);
-        e.setSingleLine(true);
-        return e;
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == 7 && pendingSave) {
+            pendingSave = false;
+            doSave();
+        }
     }
 
-    private void driveSetup() {
-        final SharedPreferences p = getSharedPreferences("drive", MODE_PRIVATE);
-        LinearLayout box = new LinearLayout(this);
-        box.setOrientation(LinearLayout.VERTICAL);
-        box.setPadding(dp(16), dp(8), dp(16), 0);
-        final EditText name = field("اسم الشاشة (اسم مجلد Drive)", p.getString("screen_name", "TS18-" + Build.MODEL));
-        final EditText cid = field("Client ID", p.getString("client_id", ""));
-        final EditText sec = field("Client Secret", p.getString("client_secret", ""));
-        box.addView(name);
-        box.addView(cid);
-        box.addView(sec);
-        new AlertDialog.Builder(this)
-                .setTitle("إعداد Google Drive")
-                .setView(box)
-                .setPositiveButton("حفظ", (d, w) -> {
-                    String newId = cid.getText().toString().trim();
-                    SharedPreferences.Editor ed = p.edit()
-                            .putString("screen_name", name.getText().toString().trim())
-                            .putString("client_id", newId)
-                            .putString("client_secret", sec.getText().toString().trim());
-                    if (!newId.equals(p.getString("client_id", ""))) ed.remove("refresh_token");
-                    ed.apply();
-                    Toast.makeText(this, "تم الحفظ", Toast.LENGTH_SHORT).show();
-                })
-                .setNegativeButton("إلغاء", null)
-                .show();
-    }
-
-    private void driveLink() {
-        append("=== ربط Google Drive ===");
-        final DriveUploader up = drive();
-        new Thread(new Runnable() {
-            @Override public void run() { up.link(); }
-        }).start();
-    }
-
-    private void driveUpload() {
-        SharedPreferences p = getSharedPreferences("drive", MODE_PRIVATE);
-        String screen = p.getString("screen_name", "TS18-" + Build.MODEL).trim();
-        if (screen.length() == 0) screen = "TS18";
-        final String folder = screen;
-        final String fileName = "report_" + new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date()) + ".txt";
-        final String content = "Screen: " + folder + "\nDevice: " + Build.MANUFACTURER + " " + Build.MODEL
+    private void doSave() {
+        String screen = ("TS18-" + Build.MODEL).replaceAll("[^A-Za-z0-9_-]", "_");
+        String fileName = screen + "_report_" + new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date()) + ".txt";
+        String content = "Screen: " + screen + "\nDevice: " + Build.MANUFACTURER + " " + Build.MODEL
                 + "\nAndroid: " + Build.VERSION.RELEASE + "\nTime: " + new Date() + "\n\n" + report.toString();
-        append("=== رفع التقرير إلى Drive (" + folder + "/" + fileName + ") ===");
-        final DriveUploader up = drive();
-        new Thread(new Runnable() {
-            @Override public void run() { up.upload(folder, fileName, content); }
-        }).start();
+        File saved = null;
+        try {
+            File dir = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "TS18-CarDiag");
+            if (!dir.exists()) dir.mkdirs();
+            File f = new File(dir, fileName);
+            writeFile(f, content);
+            saved = f;
+        } catch (Exception e) {
+            try {
+                File dir2 = getExternalFilesDir(null);
+                if (dir2 != null) {
+                    File f2 = new File(dir2, fileName);
+                    writeFile(f2, content);
+                    saved = f2;
+                }
+            } catch (Exception e2) {
+                append("فشل الحفظ: " + e2);
+            }
+        }
+        if (saved != null) {
+            MediaScannerConnection.scanFile(this, new String[]{saved.getAbsolutePath()}, null, null);
+            append("تم حفظ التقرير: " + saved.getAbsolutePath());
+            Toast.makeText(this, "تم الحفظ: " + saved.getName(), Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private void writeFile(File f, String content) throws Exception {
+        OutputStreamWriter w = new OutputStreamWriter(new FileOutputStream(f), "UTF-8");
+        w.write(content);
+        w.close();
     }
 
     private void copyReport() {
