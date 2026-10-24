@@ -1,0 +1,42 @@
+name: Build TS18 CarDiag APK
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main", "master" ]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Install Android SDK packages
+        run: |
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" "platforms;android-35" "build-tools;35.0.0"
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+      - name: Build debug APK
+        run: |
+          set +e
+          gradle assembleDebug --console=plain > build.log 2>&1
+          code=$?
+          if [ $code -ne 0 ]; then
+            grep -E "\.java:[0-9]+: error|symbol:|location:|What went wrong" -A1 build.log | grep -v '^--$' | head -9 | while IFS= read -r l; do echo "::error::$(echo "$l" | cut -c1-280)"; done
+          fi
+          exit $code
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TS18-CarDiag-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
