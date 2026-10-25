@@ -5,12 +5,15 @@ import android.app.Activity;
 import android.app.AlertDialog;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothDevice;
+import android.content.BroadcastReceiver;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
+import android.database.ContentObserver;
 import android.database.Cursor;
 import android.media.AudioManager;
 import android.media.ToneGenerator;
@@ -18,6 +21,8 @@ import android.net.Uri;
 import android.media.MediaScannerConnection;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.HandlerThread;
 import android.os.Environment;
 import android.provider.Settings;
 import android.text.InputType;
@@ -39,6 +44,10 @@ import java.io.InputStreamReader;
 import java.io.OutputStreamWriter;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Iterator;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.List;
@@ -55,6 +64,14 @@ public class MainActivity extends Activity {
     private volatile boolean watching = false;
     private ElmCan elm;
     private boolean pendingSave = false;
+    private volatile boolean testRunning = false;
+    private BroadcastReceiver bRecv;
+    private boolean bOn = false;
+    private Button bBtn;
+    private final Map<String, String> lastVals = new ConcurrentHashMap<>();
+    private final Map<String, Integer> changeCount = new ConcurrentHashMap<>();
+    private ContentObserver settingsObserver;
+    private HandlerThread obsThread;
 
     private int dp(int v) { return (int) (v * getResources().getDisplayMetrics().density + 0.5f); }
 
@@ -93,6 +110,11 @@ public class MainActivity extends Activity {
         left.addView(btn("1) معلومات الشاشة والـ firmware", v -> systemReport()));
         watchBtn = btn("2) مراقب التغيّرات: ابدأ", v -> toggleWatch());
         left.addView(watchBtn);
+        left.addView(btn("3) اختبار الأبواب (بدون ELM)", v -> doorTest()));
+        left.addView(btn("4) تحليل تطبيقات Topway", v -> analyzeTopway()));
+        left.addView(btn("5) مين بيكتب SYSTEM_DOOR؟", v -> whoWrites()));
+        bBtn = btn("6) مراقب الإشعارات: ابدأ", v -> toggleBroadcast());
+        left.addView(bBtn);
 
         TextView fl = new TextView(this);
         fl.setText("فلتر ID لفحص CAN (اختياري):");
@@ -103,7 +125,7 @@ public class MainActivity extends Activity {
         filterField.setHint("مثال: 3A2");
         filterField.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS);
         left.addView(filterField);
-        left.addView(btn("3) فحص CAN عبر ELM327", v -> chooseElm()));
+        left.addView(btn("7) فحص CAN عبر ELM327 (يحتاج جهاز)", v -> chooseElm()));
         left.addView(btn("إيقاف", v -> stopAll()));
         left.addView(btn("نسخ التقرير", v -> copyReport()));
         left.addView(btn("مشاركة التقرير", v -> shareReport()));
@@ -162,6 +184,8 @@ public class MainActivity extends Activity {
         watching = false;
         watchBtn.setText("2) مراقب التغيّرات: ابدأ");
         if (elm != null) elm.stop();
+        testRunning = false;
+        Probe.cancel = true;
         setBanner("اتوقف");
     }
 
@@ -360,7 +384,85 @@ public class MainActivity extends Activity {
         }).start();
     }
 
-    // ---------- 3) change watcher ----------
+    // ---------- change watcher (instant Settings observer + property polling) ----------
+    private static final String[] NOISE = {"phenotype", "backup_agent", "ble_scan", "wifi_scan", "boot_count", "uptime",
+            "elapsed", "timestamp", "last_", "_time", "time_", "ntp", "gservices", "finsky", "vending", "bluetooth_address",
+            "wifi_", "netstats", "cell_", "net.", "dhcp", "init.svc", "sys.sysctl", "ril.", "gsm.", "debug.", "dalvik",
+            "persist.sys.timezone", "vendor.cam", "bootanim", "sys.boot", "sys.lmk", "mobile_data", "adb_", "vendor.sys",
+            "media_button_receiver", "usage", "stats", "heartbeat", "clock"};
+    private static final String[] HOT = {"door", "can", "acc", "brake", "reverse", "gear", "park", "light", "mcu", "ldfy",
+            "speed", "ignit", "sleep", "tw"};
+
+    private static boolean isNoise(String key) {
+        return hasAny(key, NOISE);
+    }
+
+    private Map<String, String> cleanSnapshot() {
+        Map<String, String> m = snapshot(true);
+        for (Iterator<Map.Entry<String, String>> it = m.entrySet().iterator(); it.hasNext(); ) {
+            if (isNoise(it.next().getKey())) it.remove();
+        }
+        return m;
+    }
+
+    private void reportChange(String key, String oldV, String newV) {
+        if (isNoise(key)) return;
+        Integer pc = changeCount.get(key);
+        int n = pc == null ? 1 : pc + 1;
+        changeCount.put(key, n);
+        if (n > 8) {
+            if (n == 9) append("(تجاهل مفتاح كتير التغيير: " + key + ")");
+            return;
+        }
+        String t = new SimpleDateFormat("HH:mm:ss.SSS", Locale.US).format(new Date());
+        append(t + (hasAny(key, HOT) ? " ★ " : " ") + key + ": " + trunc(oldV) + " -> " + trunc(newV));
+    }
+
+    private String querySetting(Uri uri) {
+        Cursor c = null;
+        try {
+            c = getContentResolver().query(uri, new String[]{"value"}, null, null, null);
+            if (c != null && c.moveToFirst()) {
+                String v = c.getString(0);
+                return v == null ? "" : v;
+            }
+        } catch (Exception ignored) {
+        } finally {
+            if (c != null) c.close();
+        }
+        return null;
+    }
+
+    private void startObserver() {
+        obsThread = new HandlerThread("settings-observer");
+        obsThread.start();
+        settingsObserver = new ContentObserver(new Handler(obsThread.getLooper())) {
+            @Override public void onChange(boolean selfChange, Uri uri) {
+                if (uri == null) return;
+                List<String> seg = uri.getPathSegments();
+                if (seg.size() < 2) return;
+                String table = seg.get(0);
+                String prefix = table.equals("system") ? "System:" : (table.equals("secure") ? "Secure:" : "Global:");
+                String key = prefix + seg.get(1);
+                String val = querySetting(uri);
+                String old = lastVals.get(key);
+                lastVals.put(key, val == null ? "" : val);
+                if (old == null || !old.equals(val)) reportChange(key, old, val);
+            }
+        };
+        getContentResolver().registerContentObserver(Settings.System.CONTENT_URI, true, settingsObserver);
+        getContentResolver().registerContentObserver(Settings.Secure.CONTENT_URI, true, settingsObserver);
+        getContentResolver().registerContentObserver(Settings.Global.CONTENT_URI, true, settingsObserver);
+    }
+
+    private void stopObserver() {
+        try {
+            if (settingsObserver != null) getContentResolver().unregisterContentObserver(settingsObserver);
+        } catch (Exception ignored) { }
+        settingsObserver = null;
+        if (obsThread != null) { obsThread.quit(); obsThread = null; }
+    }
+
     private void toggleWatch() {
         if (watching) {
             watching = false;
@@ -369,32 +471,198 @@ public class MainActivity extends Activity {
         }
         watching = true;
         watchBtn.setText("2) مراقب التغيّرات: إيقاف");
-        setBanner("المراقب شغال — افتح/اقفل باب وشوف اللي بيتغير");
+        setBanner("المراقب شغال — افتح/اقفل باب أو حرّك الفتيس وشوف اللي بيتغير");
         new Thread(new Runnable() {
             @Override public void run() {
-                Map<String, String> prev = snapshot(true);
-                append("لقطة أولية: " + prev.size() + " مفتاح. أي تغيير هيظهر هنا:");
-                Map<String, Integer> cnt = new HashMap<>();
-                SimpleDateFormat f = new SimpleDateFormat("HH:mm:ss", Locale.US);
+                lastVals.clear();
+                changeCount.clear();
+                lastVals.putAll(snapshot(true));
+                append("لقطة أولية: " + lastVals.size() + " مفتاح. الإعدادات بتتراقب لحظياً، والخصائص كل ثانية. ★ = مفتاح مشبوه:");
+                startObserver();
                 while (watching) {
-                    try { Thread.sleep(1500); } catch (InterruptedException e) { break; }
-                    Map<String, String> cur = snapshot(true);
-                    for (Map.Entry<String, String> e : cur.entrySet()) {
-                        String old = prev.get(e.getKey());
+                    try { Thread.sleep(1000); } catch (InterruptedException e) { break; }
+                    Map<String, String> props = getprops();
+                    for (Map.Entry<String, String> e : props.entrySet()) {
+                        String key = "prop:" + e.getKey();
+                        String old = lastVals.get(key);
                         if (old == null || !old.equals(e.getValue())) {
-                            Integer prevCount = cnt.get(e.getKey());
-                            int n = prevCount == null ? 1 : prevCount + 1;
-                            cnt.put(e.getKey(), n);
-                            if (n <= 6) {
-                                append(f.format(new Date()) + " " + e.getKey() + ": " + trunc(old) + " -> " + trunc(e.getValue()));
-                            } else if (n == 7) {
-                                append("(تجاهل مفتاح كتير التغيير: " + e.getKey() + ")");
+                            lastVals.put(key, e.getValue());
+                            reportChange(key, old, e.getValue());
+                        }
+                    }
+                }
+                stopObserver();
+                append("تم إيقاف المراقب.");
+            }
+        }).start();
+    }
+
+    // ---------- guided door test using Settings/properties only ----------
+    private void beepTone() {
+        try {
+            new ToneGenerator(AudioManager.STREAM_MUSIC, 100).startTone(ToneGenerator.TONE_PROP_BEEP, 250);
+        } catch (Exception ignored) { }
+    }
+
+    private void doorTest() {
+        if (testRunning) { append("الاختبار شغال بالفعل."); return; }
+        testRunning = true;
+        append("=== اختبار الأبواب من الإعدادات والخصائص (بدون ELM) ===");
+        append("شغّل الكونتاكت. اتبع التعليمات على الشاشة، وهيطلع صوت بيب عند كل خطوة.");
+        new Thread(new Runnable() {
+            @Override public void run() {
+                try {
+                    String[] steps = {"باب السواق", "باب الراكب الأمامي", "الباب الخلفي الشمال", "الباب الخلفي اليمين", "الشنطة"};
+                    setBanner("اقفل كل الأبواب وماتلمسش حاجة");
+                    beepTone();
+                    Thread.sleep(4000);
+                    beepTone();
+                    Map<String, String> s0 = cleanSnapshot();
+                    Map<String, Integer> hits = new HashMap<>();
+                    for (int i = 0; i < steps.length && testRunning; i++) {
+                        String st = steps[i];
+                        setBanner("افتح " + st + " وسيبه مفتوح");
+                        beepTone();
+                        Thread.sleep(4500);
+                        setBanner("ثبّت — " + st + " مفتوح (بيتسجل)");
+                        beepTone();
+                        Map<String, String> s1 = cleanSnapshot();
+                        setBanner("اقفل " + st);
+                        beepTone();
+                        Thread.sleep(4500);
+                        setBanner("ثبّت — " + st + " مقفول (بيتسجل)");
+                        beepTone();
+                        Map<String, String> s2 = cleanSnapshot();
+                        List<String> cand = new ArrayList<>();
+                        for (Map.Entry<String, String> e : s0.entrySet()) {
+                            String k = e.getKey();
+                            String a = e.getValue();
+                            String b1 = s1.get(k);
+                            String c2 = s2.get(k);
+                            if (b1 != null && c2 != null && a.equals(c2) && !a.equals(b1)) {
+                                cand.add(k + ": " + trunc(a) + " -> " + trunc(b1) + " -> " + trunc(c2));
+                                Integer h = hits.get(k);
+                                hits.put(k, h == null ? 1 : h + 1);
+                            }
+                        }
+                        Collections.sort(cand);
+                        if (cand.isEmpty()) {
+                            append("[" + st + "] ما لقيتش أي مفتاح اتغيّر واترجع.");
+                        } else {
+                            append("[" + st + "] مرشحات (" + cand.size() + "):");
+                            for (int j = 0; j < Math.min(15, cand.size()); j++) append("   " + cand.get(j));
+                        }
+                        s0 = s2;
+                    }
+                    append("--- الخلاصة ---");
+                    if (hits.isEmpty()) {
+                        append("ما فيش أي مفتاح في الإعدادات أو الخصائص بيتغيّر مع الأبواب. يعني الأبواب مش بتتنشر بالطريقة دي، أو الـ decoder مش بيوصلها للـ firmware.");
+                    } else {
+                        append("مفاتيح اتغيّرت مع أكتر من باب (الأقوى):");
+                        for (Map.Entry<String, Integer> e : hits.entrySet()) {
+                            if (e.getValue() >= 2) append("   " + e.getKey() + "  (مع " + e.getValue() + " خطوات)");
+                        }
+                    }
+                } catch (InterruptedException ignored) {
+                } finally {
+                    testRunning = false;
+                    setBanner("انتهى اختبار الأبواب");
+                }
+            }
+        }).start();
+    }
+
+    // ---------- Topway package probes ----------
+    private Probe.Out probeOut() {
+        return new Probe.Out() {
+            @Override public void line(String s) { append(s); }
+            @Override public void banner(String s) { setBanner(s); }
+        };
+    }
+
+    private void analyzeTopway() {
+        append("=== تحليل تطبيقات Topway/Dofun (مكونات + إشعارات معلنة) ===");
+        setBanner("بيحلل التطبيقات...");
+        new Thread(new Runnable() {
+            @Override public void run() {
+                Probe.Out o = probeOut();
+                List<ApplicationInfo> t = Probe.targets(MainActivity.this);
+                if (t.isEmpty()) o.line("ما لقيتش تطبيقات مطابقة.");
+                for (ApplicationInfo ai : t) {
+                    Probe.components(MainActivity.this, ai, o);
+                    if (ai.sourceDir != null) {
+                        Set<String> acts = Probe.actionsOf(ai.sourceDir);
+                        if (!acts.isEmpty()) {
+                            o.line("  إشعارات/نصوص مشبوهة في الـ manifest (" + acts.size() + "):");
+                            int n = 0;
+                            for (String a : acts) {
+                                o.line("    " + a);
+                                if (++n >= 40) break;
                             }
                         }
                     }
-                    prev = cur;
                 }
-                append("تم إيقاف المراقب.");
+                o.banner("انتهى التحليل");
+            }
+        }).start();
+    }
+
+    private void whoWrites() {
+        append("=== بيدوّر في كود التطبيقات على SYSTEM_DOOR و TWCameraBrake و persist.tw.reverse (ممكن ياخد دقيقة أو اتنين) ===");
+        new Thread(new Runnable() {
+            @Override public void run() {
+                Probe.scanDex(MainActivity.this, new String[]{"SYSTEM_DOOR", "TWCameraBrake", "persist.tw.reverse"}, probeOut(), 180000);
+            }
+        }).start();
+    }
+
+    // ---------- broadcast listener ----------
+    private void toggleBroadcast() {
+        if (bOn) {
+            try { unregisterReceiver(bRecv); } catch (Exception ignored) { }
+            bOn = false;
+            bBtn.setText("6) مراقب الإشعارات: ابدأ");
+            append("تم إيقاف مراقب الإشعارات.");
+            return;
+        }
+        append("=== مراقب الإشعارات: بيجمع أسماء الإشعارات من تطبيقات Topway... ===");
+        new Thread(new Runnable() {
+            @Override public void run() {
+                final Set<String> acts = Probe.collectActions(MainActivity.this);
+                String[] std = {Intent.ACTION_SCREEN_ON, Intent.ACTION_SCREEN_OFF, Intent.ACTION_USER_PRESENT,
+                        Intent.ACTION_POWER_CONNECTED, Intent.ACTION_POWER_DISCONNECTED,
+                        "android.intent.action.ACTION_SHUTDOWN", "android.intent.action.QUICKBOOT_POWERON",
+                        "android.intent.action.QUICKBOOT_POWEROFF"};
+                for (String a : std) acts.add(a);
+                runOnUiThread(new Runnable() {
+                    @Override public void run() {
+                        IntentFilter f = new IntentFilter();
+                        for (String a : acts) {
+                            try { f.addAction(a); } catch (Exception ignored) { }
+                        }
+                        bRecv = new BroadcastReceiver() {
+                            @Override public void onReceive(Context c, Intent i) {
+                                StringBuilder sb = new StringBuilder();
+                                Bundle b = i.getExtras();
+                                if (b != null) {
+                                    for (String k : b.keySet()) sb.append(k).append("=").append(String.valueOf(b.get(k))).append(" ");
+                                }
+                                String t = new SimpleDateFormat("HH:mm:ss.SSS", Locale.US).format(new Date());
+                                append(t + " BROADCAST " + i.getAction() + " " + trunc(sb.toString()));
+                            }
+                        };
+                        registerReceiver(bRecv, f);
+                        bOn = true;
+                        bBtn.setText("6) مراقب الإشعارات: إيقاف");
+                        append("بيسمع " + acts.size() + " إشعار. اعمل أي حاجة (افتح باب، شغّل الفتيس، طفّي الشاشة) وشوف.");
+                        int n = 0;
+                        for (String a : acts) {
+                            if (a.startsWith("android.intent.action.")) continue;
+                            append("   " + a);
+                            if (++n >= 30) { append("   ..."); break; }
+                        }
+                    }
+                });
             }
         }).start();
     }
