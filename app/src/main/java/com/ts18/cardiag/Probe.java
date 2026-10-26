@@ -277,4 +277,154 @@ public class Probe {
             out.line("خطأ: " + e);
         }
     }
+
+    // ---- class descriptor extraction (Topway framework classes, app class names) ----
+    private static void extract(InputStream is, byte[][] pre, Set<String> out, int limit) throws Exception {
+        byte[] buf = new byte[65536];
+        byte[] tail = new byte[0];
+        int r;
+        while ((r = is.read(buf)) > 0) {
+            byte[] comb = new byte[tail.length + r];
+            System.arraycopy(tail, 0, comb, 0, tail.length);
+            System.arraycopy(buf, 0, comb, tail.length, r);
+            for (int i = 0; i < comb.length; i++) {
+                if (comb[i] != 'L') continue;
+                for (byte[] p : pre) {
+                    if (i + p.length >= comb.length) continue;
+                    boolean ok = true;
+                    for (int j = 0; j < p.length; j++) {
+                        if (comb[i + j] != p[j]) { ok = false; break; }
+                    }
+                    if (!ok) continue;
+                    int j = i;
+                    while (j < comb.length && j - i < 150 && comb[j] >= 0x20 && comb[j] < 0x7f && comb[j] != ';') j++;
+                    if (j < comb.length && comb[j] == ';') {
+                        out.add(new String(comb, i + 1, j - i - 1, "US-ASCII").replace('/', '.'));
+                        if (out.size() >= limit) return;
+                    }
+                }
+            }
+            int keep = Math.min(160, comb.length);
+            tail = Arrays.copyOfRange(comb, comb.length - keep, comb.length);
+        }
+    }
+
+    private static void descriptorsOfFile(File f, byte[][] pre, Set<String> out, int limit) {
+        String n = f.getName();
+        try {
+            if (n.endsWith(".jar") || n.endsWith(".apk")) {
+                ZipFile z = new ZipFile(f);
+                try {
+                    Enumeration<? extends ZipEntry> en = z.entries();
+                    while (en.hasMoreElements() && out.size() < limit) {
+                        ZipEntry e = en.nextElement();
+                        if (!e.getName().endsWith(".dex")) continue;
+                        InputStream is = z.getInputStream(e);
+                        try { extract(is, pre, out, limit); } finally { is.close(); }
+                    }
+                } finally {
+                    z.close();
+                }
+            } else if (n.endsWith(".vdex") || n.endsWith(".odex")) {
+                FileInputStream is = new FileInputStream(f);
+                try { extract(is, pre, out, limit); } finally { is.close(); }
+            }
+        } catch (Throwable ignored) { }
+    }
+
+    private static void descriptorsOfApk(String apk, byte[][] pre, Set<String> out, int limit) {
+        File f = new File(apk);
+        descriptorsOfFile(f, pre, out, limit);
+        File parent = f.getParentFile();
+        File oat = parent == null ? null : new File(parent, "oat");
+        File[] archs = oat == null ? null : oat.listFiles();
+        if (archs != null) {
+            for (File a : archs) {
+                File[] files = a.listFiles();
+                if (files == null) continue;
+                for (File x : files) if (x.length() < 80L * 1024 * 1024) descriptorsOfFile(x, pre, out, limit);
+            }
+        }
+    }
+
+    private static void collect(File d, int depth, List<File> res) {
+        File[] fs = d.listFiles();
+        if (fs == null) return;
+        for (File f : fs) {
+            if (f.isDirectory()) {
+                if (depth < 3) collect(f, depth + 1, res);
+            } else {
+                String n = f.getName();
+                if ((n.endsWith(".jar") || n.endsWith(".vdex") || n.endsWith(".odex")) && f.length() < 200L * 1024 * 1024) res.add(f);
+            }
+        }
+    }
+
+    private static byte[] ascii(String s) {
+        return s.getBytes(java.nio.charset.Charset.forName("US-ASCII"));
+    }
+
+    public static void classProbe(Context c, Out out) {
+        cancel = false;
+        try {
+            out.line("--- 1) كلاسات TWUtil (reflection) ---");
+            String[] names = {"android.tw.john.TWUtil", "com.tw.john.TWUtil", "com.tw.util.TWUtil", "android.tw.TWUtil"};
+            for (String n : names) {
+                try {
+                    Class<?> k = Class.forName(n);
+                    out.line("موجود: " + n);
+                    java.lang.reflect.Method[] ms = k.getDeclaredMethods();
+                    for (int i = 0; i < Math.min(40, ms.length); i++) out.line("   " + ms[i].toString());
+                    if (ms.length == 0) out.line("   (مفيش methods ظاهرة — غالباً قيود hidden API. جرّب من ADB: settings put global hidden_api_policy 1)");
+                } catch (Throwable t) {
+                    out.line("مش موجود/مش متاح: " + n);
+                }
+            }
+
+            out.line("--- 2) كلاسات android.tw / com.tw / com.dofun جوه ملفات الـ framework (ممكن ياخد دقيقة) ---");
+            byte[][] pre = {ascii("Landroid/tw/"), ascii("Lcom/tw/"), ascii("Lcom/dofun/")};
+            List<File> files = new ArrayList<>();
+            collect(new File("/system/framework"), 0, files);
+            Set<String> found = new TreeSet<>();
+            long start = System.currentTimeMillis();
+            for (File f : files) {
+                if (cancel || System.currentTimeMillis() - start > 120000 || found.size() >= 300) break;
+                out.banner("framework: " + f.getName());
+                descriptorsOfFile(f, pre, found, 300);
+            }
+            if (found.isEmpty()) out.line("   (ما لقيتش حاجة)");
+            int shown = 0;
+            for (String s : found) {
+                out.line("   " + s);
+                if (++shown >= 80) { out.line("   ... (" + found.size() + " كلاس)"); break; }
+            }
+
+            out.line("--- 3) أسماء كلاسات تطبيقات Topway (الكلمات المشبوهة بس) ---");
+            String[] kw = {"door", "can", "acc", "brake", "gear", "reverse", "mcu", "protocol", "hiworld", "raise", "brand", "canbox"};
+            for (ApplicationInfo ai : targets(c)) {
+                if (cancel || ai.sourceDir == null) continue;
+                out.banner("فحص كلاسات " + ai.packageName);
+                Set<String> cls = new TreeSet<>();
+                descriptorsOfApk(ai.sourceDir, new byte[][]{ascii("L" + ai.packageName.replace('.', '/') + "/")}, cls, 3000);
+                List<String> hit = new ArrayList<>();
+                for (String k : cls) {
+                    String l = k.toLowerCase(Locale.US);
+                    for (String w : kw) if (l.contains(w)) { hit.add(k); break; }
+                }
+                out.line("== " + ai.packageName + ": " + cls.size() + " كلاس، مشبوه: " + hit.size());
+                for (int i = 0; i < Math.min(60, hit.size()); i++) out.line("   " + hit.get(i));
+                if (hit.size() < 5) {
+                    int n = 0;
+                    for (String k : cls) {
+                        out.line("   (عينة) " + k);
+                        if (++n >= 25) break;
+                    }
+                }
+            }
+            out.line("انتهى فحص الكلاسات.");
+            out.banner("انتهى فحص الكلاسات");
+        } catch (Exception e) {
+            out.line("خطأ: " + e);
+        }
+    }
 }

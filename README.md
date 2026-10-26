@@ -24,3 +24,11 @@ Use **Copy report** / **Share report** to export the output.
 - **Topway analysis**: components (services/receivers/providers) and manifest action-like strings of `com.tw.*` / `com.dofun.*` packages.
 - **Who writes SYSTEM_DOOR?**: byte search of other apps' dex/odex/vdex for the keys seen in Settings.
 - **Broadcast monitor**: registers for action names found in those manifests and prints every broadcast with extras.
+
+## Advanced tools ("أدوات متقدمة…")
+- **Black box**: foreground recorder (restarts after boot) logging filtered Settings/property changes, broadcasts, filtered logcat (if READ_LOGS granted) and the parking location on screen-off/shutdown.
+- **Key & window monitor**: accessibility service logging key codes and foreground window changes (e.g. whether Recents opens at ACC-on).
+- **logcat/dumpsys**: needs a one-time `adb shell pm grant com.ts18.cardiag android.permission.READ_LOGS` (and `DUMP`, `WRITE_SECURE_SETTINGS`).
+- **Topway classes**: looks for TWUtil and `android.tw/com.tw/com.dofun` classes in the framework and the Topway apps.
+- **Snapshots**: save a full Settings+properties snapshot and diff two of them.
+- **Trip screen**: live GPS speed, trip distance, max/avg speed and the saved parking spot.

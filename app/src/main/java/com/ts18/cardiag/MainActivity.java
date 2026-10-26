@@ -64,6 +64,7 @@ public class MainActivity extends Activity {
     private volatile boolean watching = false;
     private ElmCan elm;
     private boolean pendingSave = false;
+    private Advanced adv;
     private volatile boolean testRunning = false;
     private BroadcastReceiver bRecv;
     private boolean bOn = false;
@@ -115,6 +116,8 @@ public class MainActivity extends Activity {
         left.addView(btn("5) مين بيكتب SYSTEM_DOOR؟", v -> whoWrites()));
         bBtn = btn("6) مراقب الإشعارات: ابدأ", v -> toggleBroadcast());
         left.addView(bBtn);
+        adv = new Advanced(this);
+        left.addView(btn("أدوات متقدمة…", v -> adv.menu()));
 
         TextView fl = new TextView(this);
         fl.setText("فلتر ID لفحص CAN (اختياري):");
@@ -161,7 +164,7 @@ public class MainActivity extends Activity {
         super.onDestroy();
     }
 
-    private void append(final String s) {
+    void append(final String s) {
         runOnUiThread(new Runnable() {
             @Override public void run() {
                 report.append(s).append("\n");
@@ -174,7 +177,7 @@ public class MainActivity extends Activity {
         });
     }
 
-    private void setBanner(final String s) {
+    void setBanner(final String s) {
         runOnUiThread(new Runnable() {
             @Override public void run() { banner.setText(s); }
         });
@@ -211,6 +214,7 @@ public class MainActivity extends Activity {
             pendingSave = false;
             doSave();
         }
+        if (adv != null) adv.onPermissionResult(requestCode);
     }
 
     private void doSave() {
@@ -573,7 +577,7 @@ public class MainActivity extends Activity {
     }
 
     // ---------- Topway package probes ----------
-    private Probe.Out probeOut() {
+    Probe.Out probeOut() {
         return new Probe.Out() {
             @Override public void line(String s) { append(s); }
             @Override public void banner(String s) { setBanner(s); }
